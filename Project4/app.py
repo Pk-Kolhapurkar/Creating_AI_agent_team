@@ -19,7 +19,7 @@ st.set_page_config(
 # Custom configuration for Groq
 class GroqConfig:
     def __init__(self):
-        self.api_key = "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"
+        self.api_key = "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"
         self.base_url = "https://api.groq.com/openai/v1"
         self.model = "llama-3.3-70b-versatile"
 

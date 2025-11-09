@@ -1,13 +1,11 @@
 import streamlit as st
-import autogen
-from autogen import AssistantAgent, UserProxyAgent, GroupChat, GroupChatManager
-import os
-import time
-import pandas as pd
 import yfinance as yf
+import pandas as pd
 import matplotlib.pyplot as plt
 import io
 import base64
+from datetime import datetime, timedelta
+from groq import Groq
 
 # Set page configuration
 st.set_page_config(
@@ -16,87 +14,20 @@ st.set_page_config(
     layout="wide"
 )
 
-# Custom configuration for Groq
-class GroqConfig:
-    def __init__(self):
-        self.api_key = "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"
-        self.base_url = "https://api.groq.com/openai/v1"
-        self.model = "llama-3.3-70b-versatile"
+# Initialize Groq client
+@st.cache_resource
+def get_groq_client():
+    return Groq(api_key="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")
 
-def initialize_agents():
-    """Initialize AutoGen agents with Groq configuration"""
-    
-    groq_config = GroqConfig()
-    
-    # LLM configuration for Groq
-    llm_config = {
-        "config_list": [
-            {
-                "model": groq_config.model,
-                "api_key": groq_config.api_key,
-                "api_type": "openai",
-                "base_url": groq_config.base_url,
-            }
-        ],
-        "temperature": 0.7,
-        "timeout": 120,
-        "max_tokens": 2048,
-    }
-
-    # User Proxy Agent
-    user_proxy = UserProxyAgent(
-        name="Admin",
-        system_message="""You are the Admin. Give the task to the team and provide feedback on the final report.
-        You can ask the writer to refine the blog post if needed.""",
-        code_execution_config=False,
-        human_input_mode="NEVER",
-        llm_config=llm_config,
-    )
-
-    # Planner Agent
-    planner = AssistantAgent(
-        name="Planner",
-        system_message="""You are the Planner. Given a task, determine what information is needed to complete it.
-        Focus on information that can be retrieved using Python code.
-        After each step is done by others, check progress and instruct remaining steps.
-        If a step fails, try to find workarounds.""",
-        llm_config=llm_config,
-    )
-
-    # Engineer Agent
-    engineer = AssistantAgent(
-        name="Engineer",
-        system_message="""You are the Engineer. Write Python code to accomplish the tasks specified by the Planner.
-        You can use libraries like yfinance, pandas, and matplotlib for stock analysis.
-        Make sure your code is efficient and well-documented.""",
-        llm_config=llm_config,
-    )
-
-    # Executor Agent
-    executor = UserProxyAgent(
-        name="Executor",
-        system_message="""You are the Executor. Execute the Python code written by the Engineer.
-        Report the results and any errors encountered during execution.""",
-        human_input_mode="NEVER",
-        code_execution_config={
-            "last_n_messages": 3,
-            "work_dir": "coding",
-            "use_docker": False,
-        },
-        llm_config=False,  # Executor doesn't need LLM for code execution
-    )
-
-    # Writer Agent
-    writer = AssistantAgent(
-        name="Writer",
-        system_message="""You are the Writer. Create comprehensive blog posts in markdown format.
-        Include relevant titles, sections for key statistics, trend analysis, market context, and conclusions.
-        Format the content professionally and ensure it's engaging to read.
-        Take feedback from the Admin to refine your blog.""",
-        llm_config=llm_config,
-    )
-
-    return user_proxy, planner, engineer, executor, writer
+def get_stock_data(symbol, period="3mo"):
+    """Get stock data with caching"""
+    try:
+        stock = yf.Ticker(symbol)
+        hist = stock.history(period=period)
+        return hist
+    except Exception as e:
+        st.error(f"Error fetching stock data: {str(e)}")
+        return None
 
 def create_stock_chart(stock_data, symbol):
     """Create a stock price chart"""
@@ -118,23 +49,126 @@ def create_stock_chart(stock_data, symbol):
     
     return base64.b64encode(buf.read()).decode()
 
-def get_stock_data(symbol, period="3mo"):
-    """Get stock data using yfinance"""
+def generate_stock_report(symbol, stock_data, period_display):
+    """Generate stock report using Groq with pre-computed data"""
+    
+    # Calculate key statistics
+    current_price = stock_data['Close'].iloc[-1]
+    start_price = stock_data['Close'].iloc[0]
+    high_price = stock_data['High'].max()
+    low_price = stock_data['Low'].min()
+    pct_change = ((current_price - start_price) / start_price) * 100
+    avg_volume = stock_data['Volume'].mean()
+    
+    # Calculate moving averages
+    stock_data['MA_20'] = stock_data['Close'].rolling(window=20).mean()
+    stock_data['MA_50'] = stock_data['Close'].rolling(window=50).mean()
+    
+    # Prepare the prompt with actual data
+    prompt = f"""
+    Write a comprehensive blog post about the stock price performance of {symbol} in the {period_display}. 
+    Today's date is 2024-07-26.
+    
+    Here are the actual stock statistics for {symbol}:
+    - Current Price: ${current_price:.2f}
+    - Starting Price (3 months ago): ${start_price:.2f}
+    - Highest Price: ${high_price:.2f}
+    - Lowest Price: ${low_price:.2f}
+    - Percentage Change: {pct_change:.2f}%
+    - Average Volume: {avg_volume:,.0f}
+    
+    The stock has shown a {'positive' if pct_change > 0 else 'negative'} trend over the period.
+    
+    Please write a professional blog post that includes:
+    1. Introduction to the company and its industry
+    2. Key statistics and performance overview
+    3. Trend analysis with technical insights
+    4. Market context and industry comparison
+    5. Conclusion and future outlook
+    6. Investment considerations
+    
+    Format the response in markdown with appropriate headings and sections.
+    Make it engaging and informative for investors.
+    """
+    
+    client = get_groq_client()
+    
     try:
-        stock = yf.Ticker(symbol)
-        hist = stock.history(period=period)
-        return hist
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=2048,
+            top_p=1,
+            stream=False,
+            stop=None
+        )
+        
+        return completion.choices[0].message.content
+        
     except Exception as e:
-        st.error(f"Error fetching stock data: {str(e)}")
-        return None
+        return f"Error generating report: {str(e)}"
+
+def generate_fallback_report(symbol, stock_data, period_display):
+    """Generate a fallback report if API fails"""
+    current_price = stock_data['Close'].iloc[-1]
+    start_price = stock_data['Close'].iloc[0]
+    high_price = stock_data['High'].max()
+    low_price = stock_data['Low'].min()
+    pct_change = ((current_price - start_price) / start_price) * 100
+    avg_volume = stock_data['Volume'].mean()
+    
+    report = f"""
+# {symbol} Stock Performance Analysis - {period_display}
+
+## 📊 Key Statistics
+
+| Metric | Value |
+|--------|-------|
+| **Current Price** | ${current_price:.2f} |
+| **Starting Price** | ${start_price:.2f} |
+| **Highest Price** | ${high_price:.2f} |
+| **Lowest Price** | ${low_price:.2f} |
+| **Total Change** | {pct_change:.2f}% |
+| **Average Volume** | {avg_volume:,.0f} |
+
+## 📈 Performance Summary
+
+The stock of {symbol} has shown **{'positive' if pct_change > 0 else 'negative'} performance** during the {period_display}, with a total change of **{pct_change:.2f}%**.
+
+### Trend Analysis
+- **Overall Trend**: {'Bullish' if pct_change > 0 else 'Bearish'}
+- **Price Range**: ${low_price:.2f} - ${high_price:.2f}
+- **Volatility**: Moderate to High
+
+## 🏢 Company Overview
+{symbol} operates in the automotive/technology sector with a focus on innovation and market expansion.
+
+## 🌐 Market Context
+The stock performance should be considered in the context of:
+- Overall market conditions
+- Industry-specific trends
+- Economic factors affecting the sector
+
+## 💡 Investment Considerations
+- **Strengths**: Market position, innovation pipeline
+- **Risks**: Market volatility, competition
+- **Opportunities**: Industry growth, expansion plans
+
+## 🎯 Conclusion
+Based on the {period_display} performance analysis, {symbol} demonstrates {'strong potential' if pct_change > 0 else 'areas for improvement'}. 
+
+*Note: This analysis is automated. Consult with financial advisors before making investment decisions.*
+"""
+    return report
 
 def main():
-    st.title("🤖 AI Stock Report Generator")
-    st.markdown("Multi-Agent System with AutoGen & Groq LLaMA 3.3 70B")
+    st.title("🚀 Quick Stock Report Generator")
+    st.markdown("Fast AI-powered stock analysis with minimal API calls")
     
     # Sidebar configuration
     with st.sidebar:
-        st.header("📊 Configuration")
+        st.header("⚙️ Configuration")
         
         stock_symbol = st.text_input(
             "Stock Symbol", 
@@ -142,264 +176,153 @@ def main():
             help="Enter the stock symbol (e.g., TTM for Tata Motors, NVDA, AAPL)"
         )
         
-        analysis_period = st.selectbox(
+        period_options = {
+            "1mo": "Past Month",
+            "3mo": "Past 3 Months", 
+            "6mo": "Past 6 Months",
+            "1y": "Past Year"
+        }
+        
+        period = st.selectbox(
             "Analysis Period",
-            ["1mo", "3mo", "6mo", "1y", "ytd"],
+            list(period_options.keys()),
             index=1,
-            format_func=lambda x: {
-                "1mo": "Past Month",
-                "3mo": "Past 3 Months", 
-                "6mo": "Past 6 Months",
-                "1y": "Past Year",
-                "ytd": "Year to Date"
-            }[x]
+            format_func=lambda x: period_options[x]
         )
         
         st.markdown("---")
-        st.markdown("### 🎯 AI Team")
+        st.markdown("### 🎯 Features")
         st.markdown("""
-        - **Planner**: Data requirements
-        - **Engineer**: Code writing
-        - **Executor**: Code execution  
-        - **Writer**: Report creation
+        - 📊 Real stock data
+        - 🤖 AI analysis
+        - 📈 Interactive charts
+        - ⚡ Fast generation
         """)
         
-        if st.button("🔄 Clear Chat", type="secondary"):
-            st.rerun()
-            
-        generate_btn = st.button("🚀 Generate Stock Report", type="primary", use_container_width=True)
+        generate_btn = st.button("🚀 Generate Report", type="primary", use_container_width=True)
     
     # Main content area
     col1, col2 = st.columns([3, 1])
     
     with col1:
         if generate_btn and stock_symbol:
-            # Create task
-            period_display = {
-                "1mo": "past month",
-                "3mo": "past 3 months", 
-                "6mo": "past 6 months",
-                "1y": "past year",
-                "ytd": "year to date"
-            }[analysis_period]
+            # Get period display name
+            period_display = period_options[period]
             
-            task = f"Write a comprehensive blogpost about the stock price performance of {stock_symbol} in the {period_display}. Today's date is 2024-07-26. Include key statistics, trend analysis, and market context."
-            
-            st.subheader("📋 Task")
-            st.info(task)
-            
-            # Show stock data first
+            # Fetch stock data first
             with st.spinner("📊 Fetching stock data..."):
-                stock_data = get_stock_data(stock_symbol, analysis_period)
+                stock_data = get_stock_data(stock_symbol, period)
                 
-                if stock_data is not None and not stock_data.empty:
-                    # Display basic stock info
-                    col1a, col2a, col3a, col4a = st.columns(4)
-                    
-                    with col1a:
-                        st.metric(
-                            "Current Price", 
-                            f"${stock_data['Close'].iloc[-1]:.2f}",
-                            f"${stock_data['Close'].iloc[-1] - stock_data['Close'].iloc[0]:.2f}"
-                        )
-                    
-                    with col2a:
-                        st.metric(
-                            "High", 
-                            f"${stock_data['High'].max():.2f}"
-                        )
-                    
-                    with col3a:
-                        st.metric(
-                            "Low", 
-                            f"${stock_data['Low'].min():.2f}"
-                        )
-                    
-                    with col4a:
-                        pct_change = ((stock_data['Close'].iloc[-1] - stock_data['Close'].iloc[0]) / stock_data['Close'].iloc[0]) * 100
-                        st.metric(
-                            "Total Change", 
-                            f"{pct_change:.2f}%"
-                        )
-                    
-                    # Display chart
-                    st.subheader("📈 Price Chart")
-                    chart_base64 = create_stock_chart(stock_data, stock_symbol)
-                    st.image(f"data:image/png;base64,{chart_base64}")
+                if stock_data is None or stock_data.empty:
+                    st.error(f"❌ Could not fetch data for {stock_symbol}. Please check the symbol and try again.")
+                    return
             
-            # Initialize progress tracking
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            agent_activity = st.empty()
+            # Display stock metrics and chart
+            st.subheader("📊 Stock Overview")
             
-            # Simulate agent collaboration
-            steps = [
-                "🔄 Initializing AI team...",
-                "📋 Planner analyzing requirements...",
-                "💻 Engineer writing analysis code...",
-                "📊 Executor running analysis...",
-                "✍️ Writer compiling final report...",
-                "✅ Finalizing report..."
-            ]
+            # Key metrics
+            col1a, col2a, col3a, col4a = st.columns(4)
+            current_price = stock_data['Close'].iloc[-1]
+            start_price = stock_data['Close'].iloc[0]
+            pct_change = ((current_price - start_price) / start_price) * 100
             
-            for i, step in enumerate(steps):
-                status_text.text(step)
-                agent_activity.info(f"Current step: {step}")
-                progress_bar.progress((i + 1) * (100 // len(steps)))
-                time.sleep(2)
+            with col1a:
+                st.metric(
+                    "Current Price", 
+                    f"${current_price:.2f}",
+                    f"{pct_change:.2f}%"
+                )
             
-            # Generate report using the agents
-            try:
-                with st.spinner("🤖 AI agents are collaborating to generate your report..."):
-                    # Initialize agents
-                    user_proxy, planner, engineer, executor, writer = initialize_agents()
+            with col2a:
+                st.metric("High", f"${stock_data['High'].max():.2f}")
+            
+            with col3a:
+                st.metric("Low", f"${stock_data['Low'].min():.2f}")
+            
+            with col4a:
+                st.metric("Avg Volume", f"{stock_data['Volume'].mean():,.0f}")
+            
+            # Display chart
+            st.subheader("📈 Price Chart")
+            chart_base64 = create_stock_chart(stock_data, stock_symbol)
+            st.image(f"data:image/png;base64,{chart_base64}")
+            
+            # Generate report
+            with st.spinner("🤖 Generating AI analysis..."):
+                try:
+                    report = generate_stock_report(stock_symbol, stock_data, period_display)
                     
-                    # Create group chat
-                    groupchat = GroupChat(
-                        agents=[user_proxy, planner, engineer, executor, writer],
-                        messages=[],
-                        max_round=12,
-                    )
+                    if report.startswith("Error"):
+                        st.warning("⚠️ Using fallback report due to API limits")
+                        report = generate_fallback_report(stock_symbol, stock_data, period_display)
                     
-                    # Create manager
-                    manager = GroupChatManager(
-                        groupchat=groupchat,
-                        llm_config=user_proxy.llm_config
-                    )
+                    st.subheader("📄 AI Analysis Report")
+                    st.markdown(report)
                     
-                    # Start the chat
-                    chat_result = user_proxy.initiate_chat(
-                        manager,
-                        message=task,
-                        max_turns=10
-                    )
-                
-                # Display results
-                st.subheader("📄 Generated Stock Report")
-                
-                if hasattr(chat_result, 'summary') and chat_result.summary:
-                    st.markdown(chat_result.summary)
-                elif hasattr(chat_result, 'chat_history') and chat_result.chat_history:
-                    # Extract the final report from chat history
-                    for msg in reversed(chat_result.chat_history):
-                        if hasattr(msg, 'content') and msg.content:
-                            if any(keyword in msg.content.lower() for keyword in ['blog', 'report', 'analysis', 'conclusion']):
-                                st.markdown(msg.content)
-                                break
-                    else:
-                        # Fallback: show last message
-                        last_msg = chat_result.chat_history[-1]
-                        if hasattr(last_msg, 'content'):
-                            st.markdown(last_msg.content)
-                        else:
-                            st.markdown(str(last_msg))
-                else:
-                    # Fallback: generate a simple report
-                    st.warning("Using fallback report generation...")
-                    fallback_report = generate_fallback_report(stock_symbol, stock_data, period_display)
-                    st.markdown(fallback_report)
-                
-                status_text.success("🎉 Stock report generated successfully!")
-                
-                # Download button
-                report_text = st.session_state.get('current_report', '')
-                if report_text:
+                    # Download button
                     st.download_button(
                         label="📥 Download Report",
-                        data=report_text,
+                        data=report,
                         file_name=f"{stock_symbol}_stock_report.md",
                         mime="text/markdown"
                     )
-                
-            except Exception as e:
-                st.error(f"❌ Error in AI collaboration: {str(e)}")
-                st.info("Generating fallback report...")
-                if stock_data is not None:
-                    fallback_report = generate_fallback_report(stock_symbol, stock_data, period_display)
-                    st.markdown(fallback_report)
+                    
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)}")
+                    st.info("Generating fallback report...")
+                    report = generate_fallback_report(stock_symbol, stock_data, period_display)
+                    st.markdown(report)
         
         elif not stock_symbol:
             st.warning("⚠️ Please enter a stock symbol")
         
         else:
             # Welcome message
-            st.subheader("🚀 Welcome to AI Stock Report Generator")
+            st.subheader("🎯 Quick Stock Analysis")
             st.markdown("""
-            ### How to use:
-            1. **Enter a stock symbol** in the sidebar (e.g., TTM, NVDA, AAPL)
-            2. **Select analysis period** for your report
-            3. **Click 'Generate Stock Report'** to start the AI team
+            ### Get instant stock reports with AI!
             
-            ### Example Stock Symbols:
+            **How it works:**
+            1. Enter a stock symbol
+            2. Select analysis period
+            3. Get instant AI analysis
+            
+            **Why this is better:**
+            - ⚡ **Fast**: Single API call
+            - 💰 **Efficient**: No rate limit issues
+            - 📊 **Accurate**: Real stock data
+            - 🤖 **Smart**: AI-powered insights
+            
+            **Popular Symbols:**
             - **TTM**: Tata Motors
             - **NVDA**: NVIDIA
             - **AAPL**: Apple
             - **TSLA**: Tesla
-            - **RELIANCE.NS**: Reliance Industries (NSE)
-            
-            The AI team will collaborate to fetch data, analyze trends, and create a comprehensive report.
+            - **RELIANCE.NS**: Reliance (NSE)
             """)
     
     with col2:
-        st.subheader("👥 Live Agent Activity")
+        st.subheader("⚡ Quick Stats")
         
         if generate_btn and stock_symbol:
-            activities = [
-                "🤝 Team initialized",
-                "📋 Planning data requirements",
-                "💻 Writing analysis code", 
-                "📊 Executing stock analysis",
-                "📈 Processing results",
-                "✍️ Writing final report",
-                "✅ Quality check",
-                "🎯 Report finalized"
-            ]
-            
-            for activity in activities:
-                st.write(f"• {activity}")
-                time.sleep(1.5)
-
-def generate_fallback_report(symbol, stock_data, period):
-    """Generate a fallback report if AI collaboration fails"""
-    if stock_data is None or stock_data.empty:
-        return "Unable to fetch stock data. Please check the symbol and try again."
-    
-    current_price = stock_data['Close'].iloc[-1]
-    high_price = stock_data['High'].max()
-    low_price = stock_data['Low'].min()
-    start_price = stock_data['Close'].iloc[0]
-    pct_change = ((current_price - start_price) / start_price) * 100
-    
-    report = f"""
-# {symbol} Stock Performance Analysis - {period.capitalize()}
-
-## Key Statistics
-
-- **Current Price**: ${current_price:.2f}
-- **Highest Price**: ${high_price:.2f}
-- **Lowest Price**: ${low_price:.2f}
-- **Price Change**: ${current_price - start_price:.2f} ({pct_change:.2f}%)
-- **Analysis Period**: {period}
-
-## Performance Summary
-
-The stock of {symbol} has shown {'positive' if pct_change > 0 else 'negative'} performance during the {period}, 
-with a total change of {pct_change:.2f}%.
-
-## Market Context
-
-This analysis covers the period up to July 26, 2024. The stock demonstrated volatility typical of equity markets, 
-with fluctuations influenced by market conditions, company performance, and broader economic factors.
-
-## Conclusion
-
-Based on the {period} performance, {symbol} has {'outperformed' if pct_change > 0 else 'underperformed'} relative to its starting price. 
-Investors should consider this performance in the context of their investment strategy and market conditions.
-
-*Note: This is an automated analysis. Please conduct additional research before making investment decisions.*
-"""
-    
-    return report
+            if stock_data is not None and not stock_data.empty:
+                stats = {
+                    "Data Points": len(stock_data),
+                    "Period": f"{period_display}",
+                    "Volatility": f"{(stock_data['High'] - stock_data['Low']).mean():.2f}",
+                    "Trend": "📈 Bullish" if pct_change > 0 else "📉 Bearish"
+                }
+                
+                for key, value in stats.items():
+                    st.metric(key, value)
+                
+                st.markdown("---")
+                st.markdown("### 💡 Tips")
+                st.markdown("""
+                - Check symbol format
+                - Use major exchanges
+                - Consider market hours
+                """)
 
 if __name__ == "__main__":
     main()

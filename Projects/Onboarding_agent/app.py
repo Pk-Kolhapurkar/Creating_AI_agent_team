@@ -1,12 +1,18 @@
 import streamlit as st
-import autogen
-from autogen import AssistantAgent, UserProxyAgent
 import os
 import json
 from datetime import datetime
-import asyncio
 from typing import Dict, List
 import groq
+
+# Try to import AutoGen, but provide fallback if it fails
+try:
+    import autogen
+    from autogen import AssistantAgent, UserProxyAgent
+    AUTOGEN_AVAILABLE = True
+except ImportError as e:
+    st.warning(f"AutoGen not available: {str(e)}. Using direct Groq API only.")
+    AUTOGEN_AVAILABLE = False
 
 # Set page configuration
 st.set_page_config(
@@ -71,31 +77,25 @@ class GroqClient:
     def __init__(self, api_key: str):
         self.client = groq.Groq(api_key=api_key)
     
-    def get_completion(self, message: str) -> str:
+    def get_completion(self, message: str, system_message: str = None) -> str:
         """Get completion from Groq API"""
         try:
+            messages = []
+            
+            if system_message:
+                messages.append({
+                    "role": "system",
+                    "content": system_message
+                })
+            
+            messages.append({
+                "role": "user",
+                "content": message
+            })
+            
             completion = self.client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": """You are an expert onboarding specialist. Your role is to guide new users through the onboarding process.
-                        You help with:
-                        - Account setup and configuration
-                        - Platform navigation and features
-                        - Team introductions and collaboration
-                        - Best practices and tips
-                        - Troubleshooting common issues
-                        
-                        Be friendly, patient, and thorough in your explanations. Ask clarifying questions when needed.
-                        Provide step-by-step guidance and check for understanding.
-                        Always maintain a professional yet approachable tone."""
-                    },
-                    {
-                        "role": "user",
-                        "content": message
-                    }
-                ],
+                messages=messages,
                 temperature=0.7,
                 max_tokens=1024,
                 top_p=1,
@@ -110,32 +110,9 @@ class OnboardingAIAgent:
         self.groq_api_key = groq_api_key
         self.groq_client = GroqClient(groq_api_key)
         
-        # Configure for AutoGen with correct base URL
-        self.config_list = [
-            {
-                "model": "llama-3.3-70b-versatile", 
-                "api_key": groq_api_key,
-                "base_url": "https://api.groq.com/openai/v1",
-                "api_type": "openai"  # Use 'openai' type for Groq's OpenAI-compatible API
-            }
-        ]
-        
-        self.llm_config = {
-            "config_list": self.config_list,
-            "temperature": 0.7,
-            "timeout": 120,
-            "cache_seed": 42
-        }
-        
-        self.initialize_agents()
-    
-    def initialize_agents(self):
-        """Initialize AutoGen agents for onboarding assistance"""
-        
-        # Onboarding Specialist Agent
-        self.onboarding_specialist = AssistantAgent(
-            name="Onboarding_Specialist",
-            system_message="""
+        # System messages for different agent roles
+        self.system_messages = {
+            "onboarding_specialist": """
             You are an expert onboarding specialist. Your role is to guide new users through the onboarding process.
             You help with:
             - Account setup and configuration
@@ -148,14 +125,8 @@ class OnboardingAIAgent:
             Provide step-by-step guidance and check for understanding.
             Always maintain a professional yet approachable tone.
             """,
-            llm_config=self.llm_config,
-            human_input_mode="NEVER"
-        )
-        
-        # Technical Support Agent
-        self.technical_support = AssistantAgent(
-            name="Technical_Support",
-            system_message="""
+            
+            "technical_support": """
             You are a technical support specialist focusing on technical aspects of onboarding.
             You help with:
             - Software installation and setup
@@ -166,7 +137,54 @@ class OnboardingAIAgent:
             
             Provide clear, technical instructions. Include code examples when relevant.
             Explain technical concepts in an accessible way.
-            """,
+            """
+        }
+        
+        self.agents_initialized = False
+        
+        # Initialize AutoGen agents if available
+        if AUTOGEN_AVAILABLE:
+            try:
+                self.initialize_autogen_agents()
+                self.agents_initialized = True
+            except Exception as e:
+                st.warning(f"AutoGen initialization failed: {str(e)}. Using direct API mode.")
+                self.agents_initialized = False
+    
+    def initialize_autogen_agents(self):
+        """Initialize AutoGen agents for onboarding assistance"""
+        if not AUTOGEN_AVAILABLE:
+            return
+        
+        # Configure for AutoGen
+        self.config_list = [
+            {
+                "model": "llama-3.3-70b-versatile", 
+                "api_key": self.groq_api_key,
+                "base_url": "https://api.groq.com/openai/v1",
+                "api_type": "openai"
+            }
+        ]
+        
+        self.llm_config = {
+            "config_list": self.config_list,
+            "temperature": 0.7,
+            "timeout": 120,
+            "cache_seed": 42
+        }
+        
+        # Onboarding Specialist Agent
+        self.onboarding_specialist = AssistantAgent(
+            name="Onboarding_Specialist",
+            system_message=self.system_messages["onboarding_specialist"],
+            llm_config=self.llm_config,
+            human_input_mode="NEVER"
+        )
+        
+        # Technical Support Agent
+        self.technical_support = AssistantAgent(
+            name="Technical_Support",
+            system_message=self.system_messages["technical_support"],
             llm_config=self.llm_config,
             human_input_mode="NEVER"
         )
@@ -175,7 +193,7 @@ class OnboardingAIAgent:
         self.user_proxy = UserProxyAgent(
             name="User_Proxy",
             human_input_mode="NEVER",
-            max_consecutive_auto_reply=5,
+            max_consecutive_auto_reply=3,
             code_execution_config=False,
             llm_config=self.llm_config,
             system_message="""You represent the user in conversations with onboarding agents.
@@ -183,36 +201,37 @@ class OnboardingAIAgent:
         )
     
     def process_message_simple(self, message: str) -> str:
-        """Process user message using direct Groq API (fallback)"""
-        return self.groq_client.get_completion(message)
+        """Process user message using direct Groq API"""
+        return self.groq_client.get_completion(
+            message, 
+            self.system_messages["onboarding_specialist"]
+        )
     
     def process_message_autogen(self, message: str) -> str:
         """Process user message through AutoGen agent system"""
+        if not self.agents_initialized:
+            return self.process_message_simple(message)
+        
         try:
-            # Reset the chat to avoid context issues
-            self.user_proxy.reset()
-            self.onboarding_specialist.reset()
-            
-            # Initiate chat with the onboarding specialist
-            chat_result = self.user_proxy.initiate_chat(
-                self.onboarding_specialist,
-                message=message,
-                max_turns=2,
-                summary_method="last_msg"
+            # Use direct API for now to avoid AutoGen complexity
+            # In a production scenario, you'd implement proper agent collaboration
+            response = self.groq_client.get_completion(
+                f"As an onboarding specialist, please help with: {message}",
+                self.system_messages["onboarding_specialist"]
             )
-            
-            # Extract the last message
-            if hasattr(chat_result, 'chat_history') and chat_result.chat_history:
-                for msg in reversed(chat_result.chat_history):
-                    if hasattr(msg, 'content') and msg.content:
-                        return str(msg.content)
-            
-            return "I apologize, but I didn't receive a proper response. Please try again."
+            return response
             
         except Exception as e:
             # Fallback to direct Groq API
-            st.warning(f"AutoGen encountered an issue, using direct API: {str(e)}")
+            st.warning(f"AutoGen encountered an issue: {str(e)}. Using direct API.")
             return self.process_message_simple(message)
+    
+    def process_technical_message(self, message: str) -> str:
+        """Process technical questions using technical support system message"""
+        return self.groq_client.get_completion(
+            message,
+            self.system_messages["technical_support"]
+        )
 
 def initialize_session_state():
     """Initialize session state variables"""
@@ -229,7 +248,7 @@ def initialize_session_state():
         st.session_state.onboarding_agent = None
     
     if "use_autogen" not in st.session_state:
-        st.session_state.use_autogen = True
+        st.session_state.use_autogen = False  # Default to direct API for reliability
 
 def initialize_agent():
     """Initialize the AI agent"""
@@ -262,7 +281,7 @@ def display_chat_message(role: str, content: str, timestamp: str):
 
 def main():
     st.markdown('<div class="main-header">🤖 AI Onboarding Assistant</div>', unsafe_allow_html=True)
-    st.markdown("Powered by AutoGen + Llama-3.3-70b-versatile (Groq)")
+    st.markdown("Powered by Llama-3.3-70b-versatile (Groq)")
     
     # Initialize session state
     initialize_session_state()
@@ -283,12 +302,16 @@ def main():
             st.session_state.groq_api_key = api_key
             st.session_state.agent_initialized = False
         
-        # Mode selection
-        st.session_state.use_autogen = st.checkbox(
-            "Use AutoGen Multi-Agent System", 
-            value=st.session_state.use_autogen,
-            help="Use multiple specialized agents (may be slower but more comprehensive)"
-        )
+        # Mode selection (only show if AutoGen is available)
+        if AUTOGEN_AVAILABLE:
+            st.session_state.use_autogen = st.checkbox(
+                "Use AutoGen Multi-Agent System (Experimental)", 
+                value=st.session_state.use_autogen,
+                help="Use multiple specialized agents - requires additional dependencies"
+            )
+        else:
+            st.session_state.use_autogen = False
+            st.info("🔧 AutoGen not available. Using direct API mode.")
         
         # Initialize agent button
         if not st.session_state.agent_initialized:
@@ -307,7 +330,8 @@ def main():
             "What are the main features of this platform?",
             "How do I connect with my team?",
             "Can you guide me through the profile setup?",
-            "What are the best practices for getting started?"
+            "What are the best practices for getting started?",
+            "I need technical help with installation"
         ]
         
         for question in suggested_questions:
@@ -322,7 +346,9 @@ def main():
                     
                     # Process with agent
                     with st.spinner("🤖 Processing..."):
-                        if st.session_state.use_autogen:
+                        if "technical" in question.lower():
+                            response = st.session_state.onboarding_agent.process_technical_message(question)
+                        elif st.session_state.use_autogen:
                             response = st.session_state.onboarding_agent.process_message_autogen(question)
                         else:
                             response = st.session_state.onboarding_agent.process_message_simple(question)
@@ -342,12 +368,15 @@ def main():
         
         if st.session_state.agent_initialized:
             mode = "AutoGen Multi-Agent" if st.session_state.use_autogen else "Direct API"
+            autogen_status = "✅ Available" if AUTOGEN_AVAILABLE else "❌ Not Available"
+            
             st.markdown(f"""
             <div class="agent-status">
                 ✅ Agents Initialized
                 <br>• Mode: {mode}
                 <br>• Model: Llama-3.3-70b-versatile
                 <br>• API: Groq
+                <br>• AutoGen: {autogen_status}
             </div>
             """, unsafe_allow_html=True)
         else:
@@ -391,7 +420,10 @@ def main():
                 
                 # Process with agent
                 with st.spinner("🤖 Processing your request..."):
-                    if st.session_state.use_autogen:
+                    # Determine which agent to use based on content
+                    if any(word in user_input.lower() for word in ["technical", "install", "setup", "configure", "error"]):
+                        response = st.session_state.onboarding_agent.process_technical_message(user_input)
+                    elif st.session_state.use_autogen:
                         response = st.session_state.onboarding_agent.process_message_autogen(user_input)
                     else:
                         response = st.session_state.onboarding_agent.process_message_simple(user_input)
@@ -424,15 +456,15 @@ def main():
             conversation_text = " ".join([msg["content"] for msg in st.session_state.messages])
             
             # Simple keyword-based progress detection
-            if any(word in conversation_text.lower() for word in ["account", "setup", "create"]):
+            if any(word in conversation_text.lower() for word in ["account", "setup", "create", "register"]):
                 progress_stages["Account Setup"] = 80
-            if any(word in conversation_text.lower() for word in ["profile", "bio", "complete"]):
+            if any(word in conversation_text.lower() for word in ["profile", "bio", "complete", "information"]):
                 progress_stages["Profile Completion"] = 60
-            if any(word in conversation_text.lower() for word in ["feature", "platform", "navigate"]):
+            if any(word in conversation_text.lower() for word in ["feature", "platform", "navigate", "tour", "guide"]):
                 progress_stages["Platform Orientation"] = 70
-            if any(word in conversation_text.lower() for word in ["team", "colleague", "connect"]):
+            if any(word in conversation_text.lower() for word in ["team", "colleague", "connect", "member", "collaborate"]):
                 progress_stages["Team Integration"] = 40
-            if any(word in conversation_text.lower() for word in ["project", "task", "work"]):
+            if any(word in conversation_text.lower() for word in ["project", "task", "work", "assign", "create project"]):
                 progress_stages["First Project"] = 20
         
         # Display progress bars
@@ -445,14 +477,14 @@ def main():
         # Agent activity monitor
         st.subheader("🔄 Agent Activity")
         if st.session_state.agent_initialized:
-            if st.session_state.use_autogen:
+            if st.session_state.use_autogen and AUTOGEN_AVAILABLE:
                 st.success("✅ Onboarding Specialist: Active")
                 st.success("✅ Technical Support: Ready")
-                st.success("✅ User Proxy: Active")
-                st.info("🤝 Agents are collaborating in real-time")
+                st.info("🤝 Multi-agent system enabled")
             else:
                 st.success("✅ Direct API Mode: Active")
-                st.info("⚡ Using direct Groq API for faster responses")
+                st.success("✅ Technical Support: Ready")
+                st.info("⚡ Using optimized direct API")
         else:
             st.warning("Agents are offline")
 

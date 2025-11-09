@@ -6,6 +6,7 @@ import json
 from datetime import datetime
 import asyncio
 from typing import Dict, List
+import groq
 
 # Set page configuration
 st.set_page_config(
@@ -66,15 +67,56 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+class GroqClient:
+    def __init__(self, api_key: str):
+        self.client = groq.Groq(api_key=api_key)
+    
+    def get_completion(self, message: str) -> str:
+        """Get completion from Groq API"""
+        try:
+            completion = self.client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """You are an expert onboarding specialist. Your role is to guide new users through the onboarding process.
+                        You help with:
+                        - Account setup and configuration
+                        - Platform navigation and features
+                        - Team introductions and collaboration
+                        - Best practices and tips
+                        - Troubleshooting common issues
+                        
+                        Be friendly, patient, and thorough in your explanations. Ask clarifying questions when needed.
+                        Provide step-by-step guidance and check for understanding.
+                        Always maintain a professional yet approachable tone."""
+                    },
+                    {
+                        "role": "user",
+                        "content": message
+                    }
+                ],
+                temperature=0.7,
+                max_tokens=1024,
+                top_p=1,
+                stream=False
+            )
+            return completion.choices[0].message.content
+        except Exception as e:
+            return f"I apologize, but I encountered an error: {str(e)}. Please try again."
+
 class OnboardingAIAgent:
     def __init__(self, groq_api_key: str):
         self.groq_api_key = groq_api_key
+        self.groq_client = GroqClient(groq_api_key)
+        
+        # Configure for AutoGen with correct base URL
         self.config_list = [
             {
-                "model": "llama-3.3-70b-versatile",
+                "model": "llama-3.3-70b-versatile", 
                 "api_key": groq_api_key,
                 "base_url": "https://api.groq.com/openai/v1",
-                "api_type": "groq"
+                "api_type": "openai"  # Use 'openai' type for Groq's OpenAI-compatible API
             }
         ]
         
@@ -133,32 +175,44 @@ class OnboardingAIAgent:
         self.user_proxy = UserProxyAgent(
             name="User_Proxy",
             human_input_mode="NEVER",
-            max_consecutive_auto_reply=10,
+            max_consecutive_auto_reply=5,
             code_execution_config=False,
             llm_config=self.llm_config,
             system_message="""You represent the user in conversations with onboarding agents.
             Always be clear about user needs and provide context when necessary."""
         )
     
-    def process_message(self, message: str) -> str:
-        """Process user message through the agent system"""
+    def process_message_simple(self, message: str) -> str:
+        """Process user message using direct Groq API (fallback)"""
+        return self.groq_client.get_completion(message)
+    
+    def process_message_autogen(self, message: str) -> str:
+        """Process user message through AutoGen agent system"""
         try:
+            # Reset the chat to avoid context issues
+            self.user_proxy.reset()
+            self.onboarding_specialist.reset()
+            
             # Initiate chat with the onboarding specialist
             chat_result = self.user_proxy.initiate_chat(
                 self.onboarding_specialist,
                 message=message,
+                max_turns=2,
                 summary_method="last_msg"
             )
             
-            # Extract the last message from the chat result
+            # Extract the last message
             if hasattr(chat_result, 'chat_history') and chat_result.chat_history:
-                last_message = chat_result.chat_history[-1]
-                if hasattr(last_message, 'content'):
-                    return str(last_message.content)
-            return str(chat_result)
+                for msg in reversed(chat_result.chat_history):
+                    if hasattr(msg, 'content') and msg.content:
+                        return str(msg.content)
+            
+            return "I apologize, but I didn't receive a proper response. Please try again."
             
         except Exception as e:
-            return f"I apologize, but I encountered an error: {str(e)}. Please try again."
+            # Fallback to direct Groq API
+            st.warning(f"AutoGen encountered an issue, using direct API: {str(e)}")
+            return self.process_message_simple(message)
 
 def initialize_session_state():
     """Initialize session state variables"""
@@ -173,6 +227,9 @@ def initialize_session_state():
     
     if "onboarding_agent" not in st.session_state:
         st.session_state.onboarding_agent = None
+    
+    if "use_autogen" not in st.session_state:
+        st.session_state.use_autogen = True
 
 def initialize_agent():
     """Initialize the AI agent"""
@@ -226,6 +283,13 @@ def main():
             st.session_state.groq_api_key = api_key
             st.session_state.agent_initialized = False
         
+        # Mode selection
+        st.session_state.use_autogen = st.checkbox(
+            "Use AutoGen Multi-Agent System", 
+            value=st.session_state.use_autogen,
+            help="Use multiple specialized agents (may be slower but more comprehensive)"
+        )
+        
         # Initialize agent button
         if not st.session_state.agent_initialized:
             if st.button("🚀 Initialize AI Agent", use_container_width=True):
@@ -258,7 +322,10 @@ def main():
                     
                     # Process with agent
                     with st.spinner("🤖 Processing..."):
-                        response = st.session_state.onboarding_agent.process_message(question)
+                        if st.session_state.use_autogen:
+                            response = st.session_state.onboarding_agent.process_message_autogen(question)
+                        else:
+                            response = st.session_state.onboarding_agent.process_message_simple(question)
                     
                     # Add assistant response
                     st.session_state.messages.append({
@@ -274,12 +341,13 @@ def main():
         st.header("🛠️ Agent Status")
         
         if st.session_state.agent_initialized:
-            st.markdown("""
+            mode = "AutoGen Multi-Agent" if st.session_state.use_autogen else "Direct API"
+            st.markdown(f"""
             <div class="agent-status">
-                ✅ Agents Initialized:
-                <br>• Onboarding Specialist
-                <br>• Technical Support
-                <br>• User Proxy
+                ✅ Agents Initialized
+                <br>• Mode: {mode}
+                <br>• Model: Llama-3.3-70b-versatile
+                <br>• API: Groq
             </div>
             """, unsafe_allow_html=True)
         else:
@@ -322,8 +390,11 @@ def main():
                 })
                 
                 # Process with agent
-                with st.spinner("🤖 Agents are collaborating to help you..."):
-                    response = st.session_state.onboarding_agent.process_message(user_input)
+                with st.spinner("🤖 Processing your request..."):
+                    if st.session_state.use_autogen:
+                        response = st.session_state.onboarding_agent.process_message_autogen(user_input)
+                    else:
+                        response = st.session_state.onboarding_agent.process_message_simple(user_input)
                 
                 # Add assistant response
                 st.session_state.messages.append({
@@ -374,10 +445,14 @@ def main():
         # Agent activity monitor
         st.subheader("🔄 Agent Activity")
         if st.session_state.agent_initialized:
-            st.success("✅ Onboarding Specialist: Active")
-            st.success("✅ Technical Support: Ready")
-            st.success("✅ User Proxy: Active")
-            st.info("🤝 Agents are collaborating in real-time")
+            if st.session_state.use_autogen:
+                st.success("✅ Onboarding Specialist: Active")
+                st.success("✅ Technical Support: Ready")
+                st.success("✅ User Proxy: Active")
+                st.info("🤝 Agents are collaborating in real-time")
+            else:
+                st.success("✅ Direct API Mode: Active")
+                st.info("⚡ Using direct Groq API for faster responses")
         else:
             st.warning("Agents are offline")
 

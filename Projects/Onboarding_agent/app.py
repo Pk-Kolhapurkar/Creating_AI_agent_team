@@ -74,7 +74,7 @@ class OnboardingAIAgent:
                 "model": "llama-3.3-70b-versatile",
                 "api_key": groq_api_key,
                 "base_url": "https://api.groq.com/openai/v1",
-                "api_type": "open_ai"
+                "api_type": "groq"
             }
         ]
         
@@ -150,6 +150,11 @@ class OnboardingAIAgent:
                 summary_method="last_msg"
             )
             
+            # Extract the last message from the chat result
+            if hasattr(chat_result, 'chat_history') and chat_result.chat_history:
+                last_message = chat_result.chat_history[-1]
+                if hasattr(last_message, 'content'):
+                    return str(last_message.content)
             return str(chat_result)
             
         except Exception as e:

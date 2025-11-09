@@ -1,10 +1,13 @@
 import streamlit as st
 import autogen
-from groq import Groq
-import asyncio
-import threading
-from queue import Queue
+from autogen import AssistantAgent, UserProxyAgent, GroupChat, GroupChatManager
+import os
 import time
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+import io
+import base64
 
 # Set page configuration
 st.set_page_config(
@@ -13,314 +16,390 @@ st.set_page_config(
     layout="wide"
 )
 
-# Initialize Groq client
-def get_groq_client():
-    return Groq(api_key="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")
-
-# Custom LLM configuration for Groq
-class GroqLLMConfig:
+# Custom configuration for Groq
+class GroqConfig:
     def __init__(self):
-        self.client = get_groq_client()
-    
-    def create_chat_completion(self, messages, **kwargs):
-        try:
-            response = self.client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-                temperature=kwargs.get('temperature', 0.7),
-                max_tokens=kwargs.get('max_tokens', 1024),
-                top_p=kwargs.get('top_p', 1),
-                stream=False,
-                stop=kwargs.get('stop', None)
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            return f"Error: {str(e)}"
+        self.api_key = "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"
+        self.base_url = "https://api.groq.com/openai/v1"
+        self.model = "llama-3.3-70b-versatile"
 
-# Initialize AutoGen agents with Groq
 def initialize_agents():
-    groq_llm = GroqLLMConfig()
+    """Initialize AutoGen agents with Groq configuration"""
     
+    groq_config = GroqConfig()
+    
+    # LLM configuration for Groq
     llm_config = {
-        "config_list": [{
-            "type": "groq",
-            "model": "llama-3.3-70b-versatile",
-            "api_key": "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"
-        }],
+        "config_list": [
+            {
+                "model": groq_config.model,
+                "api_key": groq_config.api_key,
+                "api_type": "openai",
+                "base_url": groq_config.base_url,
+            }
+        ],
+        "temperature": 0.7,
         "timeout": 120,
-        "temperature": 0.7
+        "max_tokens": 2048,
     }
 
     # User Proxy Agent
-    user_proxy = autogen.ConversableAgent(
+    user_proxy = UserProxyAgent(
         name="Admin",
-        system_message="Give the task, and send instructions to writer to refine the blog post.",
+        system_message="""You are the Admin. Give the task to the team and provide feedback on the final report.
+        You can ask the writer to refine the blog post if needed.""",
         code_execution_config=False,
-        llm_config=llm_config,
         human_input_mode="NEVER",
+        llm_config=llm_config,
     )
 
     # Planner Agent
-    planner = autogen.ConversableAgent(
+    planner = AssistantAgent(
         name="Planner",
-        system_message="Given a task, please determine what information is needed to complete the task. "
-                      "Please note that the information will all be retrieved using Python code. "
-                      "Please only suggest information that can be retrieved using Python code. "
-                      "After each step is done by others, check the progress and instruct the remaining steps. "
-                      "If a step fails, try to workaround",
-        description="Planner. Given a task, determine what information is needed to complete the task. "
-                   "After each step is done by others, check the progress and instruct the remaining steps",
+        system_message="""You are the Planner. Given a task, determine what information is needed to complete it.
+        Focus on information that can be retrieved using Python code.
+        After each step is done by others, check progress and instruct remaining steps.
+        If a step fails, try to find workarounds.""",
         llm_config=llm_config,
     )
 
     # Engineer Agent
-    engineer = autogen.AssistantAgent(
+    engineer = AssistantAgent(
         name="Engineer",
+        system_message="""You are the Engineer. Write Python code to accomplish the tasks specified by the Planner.
+        You can use libraries like yfinance, pandas, and matplotlib for stock analysis.
+        Make sure your code is efficient and well-documented.""",
         llm_config=llm_config,
-        description="An engineer that writes code based on the plan provided by the planner.",
     )
 
     # Executor Agent
-    executor = autogen.ConversableAgent(
+    executor = UserProxyAgent(
         name="Executor",
-        system_message="Execute the code written by the engineer and report the result.",
+        system_message="""You are the Executor. Execute the Python code written by the Engineer.
+        Report the results and any errors encountered during execution.""",
         human_input_mode="NEVER",
         code_execution_config={
             "last_n_messages": 3,
             "work_dir": "coding",
             "use_docker": False,
         },
+        llm_config=False,  # Executor doesn't need LLM for code execution
     )
 
     # Writer Agent
-    writer = autogen.ConversableAgent(
+    writer = AssistantAgent(
         name="Writer",
+        system_message="""You are the Writer. Create comprehensive blog posts in markdown format.
+        Include relevant titles, sections for key statistics, trend analysis, market context, and conclusions.
+        Format the content professionally and ensure it's engaging to read.
+        Take feedback from the Admin to refine your blog.""",
         llm_config=llm_config,
-        system_message="Writer. Please write blogs in markdown format (with relevant titles) "
-                      "and put the content in pseudo ```md``` code block. "
-                      "You take feedback from the admin and refine your blog.",
-        description="Writer. Write blogs based on the code execution results and take "
-                   "feedback from the admin to refine the blog."
     )
 
     return user_proxy, planner, engineer, executor, writer
 
-# Custom group chat manager to capture messages
-class StreamlitGroupChatManager(autogen.GroupChatManager):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.message_queue = Queue()
-        
-    def send(self, message, recipient, request_reply=None, silent=False):
-        # Capture messages for Streamlit display
-        if hasattr(self, 'message_queue'):
-            self.message_queue.put({
-                'sender': self.name,
-                'recipient': recipient.name,
-                'message': message
-            })
-        return super().send(message, recipient, request_reply=request_reply, silent=silent)
+def create_stock_chart(stock_data, symbol):
+    """Create a stock price chart"""
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(stock_data.index, stock_data['Close'], label=f'{symbol} Closing Price', linewidth=2)
+    ax.set_title(f'{symbol} Stock Price - Past 3 Months', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Date', fontsize=12)
+    ax.set_ylabel('Price (USD)', fontsize=12)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    
+    # Convert plot to base64 for display in Streamlit
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
+    
+    return base64.b64encode(buf.read()).decode()
 
-def run_group_chat(task, message_container, progress_bar):
-    """Run the group chat and update Streamlit UI with progress"""
+def get_stock_data(symbol, period="3mo"):
+    """Get stock data using yfinance"""
     try:
-        # Initialize agents
-        user_proxy, planner, engineer, executor, writer = initialize_agents()
-        
-        # Create group chat
-        groupchat = autogen.GroupChat(
-            agents=[user_proxy, engineer, writer, executor, planner],
-            messages=[],
-            max_round=20,
-        )
-        
-        # Create custom manager
-        manager = StreamlitGroupChatManager(
-            groupchat=groupchat, 
-            llm_config=initialize_agents()[0].llm_config  # Get llm_config from any agent
-        )
-        
-        # Start the chat
-        message_container.info("🚀 Starting AI team collaboration...")
-        
-        # Run the chat
-        chat_result = user_proxy.initiate_chat(
-            manager,
-            message=task,
-            max_turns=20
-        )
-        
-        return chat_result
-        
+        stock = yf.Ticker(symbol)
+        hist = stock.history(period=period)
+        return hist
     except Exception as e:
-        message_container.error(f"Error in group chat: {str(e)}")
+        st.error(f"Error fetching stock data: {str(e)}")
         return None
 
 def main():
     st.title("🤖 AI Stock Report Generator")
-    st.markdown("Using Multi-Agent System with AutoGen and Groq LLaMA 3.3 70B")
+    st.markdown("Multi-Agent System with AutoGen & Groq LLaMA 3.3 70B")
     
     # Sidebar configuration
     with st.sidebar:
-        st.header("📊 Stock Analysis Setup")
+        st.header("📊 Configuration")
         
         stock_symbol = st.text_input(
             "Stock Symbol", 
-            value="NVDA",
-            help="Enter the stock symbol (e.g., NVDA, AAPL, TSLA)"
+            value="TTM",
+            help="Enter the stock symbol (e.g., TTM for Tata Motors, NVDA, AAPL)"
         )
         
         analysis_period = st.selectbox(
             "Analysis Period",
-            ["Past Month", "Past 3 Months", "Past 6 Months", "Past Year", "YTD"],
-            index=0
+            ["1mo", "3mo", "6mo", "1y", "ytd"],
+            index=1,
+            format_func=lambda x: {
+                "1mo": "Past Month",
+                "3mo": "Past 3 Months", 
+                "6mo": "Past 6 Months",
+                "1y": "Past Year",
+                "ytd": "Year to Date"
+            }[x]
         )
         
         st.markdown("---")
-        st.markdown("### 🎯 AI Team Members")
+        st.markdown("### 🎯 AI Team")
         st.markdown("""
-        - **Planner**: Determines data requirements
-        - **Engineer**: Writes analysis code
-        - **Executor**: Runs the code
-        - **Writer**: Creates final report
+        - **Planner**: Data requirements
+        - **Engineer**: Code writing
+        - **Executor**: Code execution  
+        - **Writer**: Report creation
         """)
         
-        generate_btn = st.button("Generate Stock Report", type="primary", use_container_width=True)
+        if st.button("🔄 Clear Chat", type="secondary"):
+            st.rerun()
+            
+        generate_btn = st.button("🚀 Generate Stock Report", type="primary", use_container_width=True)
     
     # Main content area
     col1, col2 = st.columns([3, 1])
     
     with col1:
-        if generate_btn:
-            # Create task string
-            task = f"Write a blogpost about the stock price performance of {stock_symbol} in the {analysis_period.lower()}. Today's date is 2024-07-26."
+        if generate_btn and stock_symbol:
+            # Create task
+            period_display = {
+                "1mo": "past month",
+                "3mo": "past 3 months", 
+                "6mo": "past 6 months",
+                "1y": "past year",
+                "ytd": "year to date"
+            }[analysis_period]
+            
+            task = f"Write a comprehensive blogpost about the stock price performance of {stock_symbol} in the {period_display}. Today's date is 2024-07-26. Include key statistics, trend analysis, and market context."
             
             st.subheader("📋 Task")
             st.info(task)
             
-            # Create containers for progress and results
-            progress_container = st.container()
-            message_container = st.empty()
-            result_container = st.container()
+            # Show stock data first
+            with st.spinner("📊 Fetching stock data..."):
+                stock_data = get_stock_data(stock_symbol, analysis_period)
+                
+                if stock_data is not None and not stock_data.empty:
+                    # Display basic stock info
+                    col1a, col2a, col3a, col4a = st.columns(4)
+                    
+                    with col1a:
+                        st.metric(
+                            "Current Price", 
+                            f"${stock_data['Close'].iloc[-1]:.2f}",
+                            f"${stock_data['Close'].iloc[-1] - stock_data['Close'].iloc[0]:.2f}"
+                        )
+                    
+                    with col2a:
+                        st.metric(
+                            "High", 
+                            f"${stock_data['High'].max():.2f}"
+                        )
+                    
+                    with col3a:
+                        st.metric(
+                            "Low", 
+                            f"${stock_data['Low'].min():.2f}"
+                        )
+                    
+                    with col4a:
+                        pct_change = ((stock_data['Close'].iloc[-1] - stock_data['Close'].iloc[0]) / stock_data['Close'].iloc[0]) * 100
+                        st.metric(
+                            "Total Change", 
+                            f"{pct_change:.2f}%"
+                        )
+                    
+                    # Display chart
+                    st.subheader("📈 Price Chart")
+                    chart_base64 = create_stock_chart(stock_data, stock_symbol)
+                    st.image(f"data:image/png;base64,{chart_base64}")
             
-            with progress_container:
-                st.subheader("👥 AI Team Activity")
-                
-                # Initialize progress
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                # Simulate progress updates
-                for i in range(5):
-                    status_text.text(f"🔄 Step {i+1}/5: AI agents collaborating...")
-                    progress_bar.progress((i + 1) * 20)
-                    time.sleep(1)
-                
-                status_text.text("✅ Generating final report...")
-                progress_bar.progress(100)
+            # Initialize progress tracking
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            agent_activity = st.empty()
             
-            # Run the group chat
-            with st.spinner("AI agents are working together to generate your report..."):
-                try:
-                    # Initialize agents and run chat
+            # Simulate agent collaboration
+            steps = [
+                "🔄 Initializing AI team...",
+                "📋 Planner analyzing requirements...",
+                "💻 Engineer writing analysis code...",
+                "📊 Executor running analysis...",
+                "✍️ Writer compiling final report...",
+                "✅ Finalizing report..."
+            ]
+            
+            for i, step in enumerate(steps):
+                status_text.text(step)
+                agent_activity.info(f"Current step: {step}")
+                progress_bar.progress((i + 1) * (100 // len(steps)))
+                time.sleep(2)
+            
+            # Generate report using the agents
+            try:
+                with st.spinner("🤖 AI agents are collaborating to generate your report..."):
+                    # Initialize agents
                     user_proxy, planner, engineer, executor, writer = initialize_agents()
                     
                     # Create group chat
-                    groupchat = autogen.GroupChat(
-                        agents=[user_proxy, engineer, writer, executor, planner],
+                    groupchat = GroupChat(
+                        agents=[user_proxy, planner, engineer, executor, writer],
                         messages=[],
-                        max_round=15,
+                        max_round=12,
                     )
                     
                     # Create manager
-                    manager = autogen.GroupChatManager(
-                        groupchat=groupchat, 
+                    manager = GroupChatManager(
+                        groupchat=groupchat,
                         llm_config=user_proxy.llm_config
                     )
                     
-                    # Run the chat
+                    # Start the chat
                     chat_result = user_proxy.initiate_chat(
                         manager,
                         message=task,
-                        max_turns=15
+                        max_turns=10
                     )
-                    
-                    # Display results
-                    with result_container:
-                        st.subheader("📄 Generated Stock Report")
-                        
-                        if hasattr(chat_result, 'summary'):
-                            st.markdown(chat_result.summary)
+                
+                # Display results
+                st.subheader("📄 Generated Stock Report")
+                
+                if hasattr(chat_result, 'summary') and chat_result.summary:
+                    st.markdown(chat_result.summary)
+                elif hasattr(chat_result, 'chat_history') and chat_result.chat_history:
+                    # Extract the final report from chat history
+                    for msg in reversed(chat_result.chat_history):
+                        if hasattr(msg, 'content') and msg.content:
+                            if any(keyword in msg.content.lower() for keyword in ['blog', 'report', 'analysis', 'conclusion']):
+                                st.markdown(msg.content)
+                                break
+                    else:
+                        # Fallback: show last message
+                        last_msg = chat_result.chat_history[-1]
+                        if hasattr(last_msg, 'content'):
+                            st.markdown(last_msg.content)
                         else:
-                            # Extract the last message which should be the report
-                            if chat_result and hasattr(chat_result, 'chat_history'):
-                                last_message = chat_result.chat_history[-1] if chat_result.chat_history else "No report generated"
-                                if hasattr(last_message, 'content'):
-                                    st.markdown(last_message.content)
-                                else:
-                                    st.markdown(str(last_message))
-                            else:
-                                st.error("No report was generated. Please try again.")
-                    
-                    message_container.success("🎉 Stock report generated successfully!")
-                    
-                except Exception as e:
-                    message_container.error(f"❌ Error: {str(e)}")
-                    st.error("Please check your API key and try again.")
+                            st.markdown(str(last_msg))
+                else:
+                    # Fallback: generate a simple report
+                    st.warning("Using fallback report generation...")
+                    fallback_report = generate_fallback_report(stock_symbol, stock_data, period_display)
+                    st.markdown(fallback_report)
+                
+                status_text.success("🎉 Stock report generated successfully!")
+                
+                # Download button
+                report_text = st.session_state.get('current_report', '')
+                if report_text:
+                    st.download_button(
+                        label="📥 Download Report",
+                        data=report_text,
+                        file_name=f"{stock_symbol}_stock_report.md",
+                        mime="text/markdown"
+                    )
+                
+            except Exception as e:
+                st.error(f"❌ Error in AI collaboration: {str(e)}")
+                st.info("Generating fallback report...")
+                if stock_data is not None:
+                    fallback_report = generate_fallback_report(stock_symbol, stock_data, period_display)
+                    st.markdown(fallback_report)
+        
+        elif not stock_symbol:
+            st.warning("⚠️ Please enter a stock symbol")
         
         else:
-            # Show instructions when no report is generated
-            st.subheader("Welcome to AI Stock Report Generator")
+            # Welcome message
+            st.subheader("🚀 Welcome to AI Stock Report Generator")
             st.markdown("""
-            ### How it works:
-            
-            1. **Enter a stock symbol** in the sidebar (e.g., NVDA, AAPL, TSLA)
-            2. **Select analysis period** for the report
+            ### How to use:
+            1. **Enter a stock symbol** in the sidebar (e.g., TTM, NVDA, AAPL)
+            2. **Select analysis period** for your report
             3. **Click 'Generate Stock Report'** to start the AI team
             
-            ### What happens behind the scenes:
+            ### Example Stock Symbols:
+            - **TTM**: Tata Motors
+            - **NVDA**: NVIDIA
+            - **AAPL**: Apple
+            - **TSLA**: Tesla
+            - **RELIANCE.NS**: Reliance Industries (NSE)
             
-            🤖 **Planner Agent**: Analyzes what data is needed
-            💻 **Engineer Agent**: Writes Python code to fetch and analyze stock data  
-            📊 **Executor Agent**: Runs the code and processes the data
-            ✍️ **Writer Agent**: Creates a comprehensive blog post with analysis
-            
-            The agents collaborate using the **Groq LLaMA 3.3 70B model** to generate professional stock reports.
+            The AI team will collaborate to fetch data, analyze trends, and create a comprehensive report.
             """)
     
     with col2:
-        st.subheader("🔍 Live Agent Activity")
+        st.subheader("👥 Live Agent Activity")
         
-        if generate_btn:
-            # Simulate agent activity
-            agent_activities = [
-                "🔄 Planner: Determining data requirements...",
-                "💻 Engineer: Writing analysis code...",
-                "📊 Executor: Fetching stock data...",
-                "📈 Executor: Calculating statistics...",
-                "✍️ Writer: Compiling final report...",
-                "✅ Finalizing report...",
+        if generate_btn and stock_symbol:
+            activities = [
+                "🤝 Team initialized",
+                "📋 Planning data requirements",
+                "💻 Writing analysis code", 
+                "📊 Executing stock analysis",
+                "📈 Processing results",
+                "✍️ Writing final report",
+                "✅ Quality check",
+                "🎯 Report finalized"
             ]
             
-            activity_container = st.container()
-            
-            with activity_container:
-                for i, activity in enumerate(agent_activities):
-                    st.write(f"{activity}")
-                    time.sleep(1.5)
-        
-        st.markdown("---")
-        st.subheader("📋 Supported Stocks")
-        st.markdown("""
-        - **NVDA**: NVIDIA
-        - **AAPL**: Apple
-        - **TSLA**: Tesla
-        - **MSFT**: Microsoft
-        - **GOOGL**: Google
-        - **AMZN**: Amazon
-        - **META**: Meta
-        - **And many more...**
-        """)
+            for activity in activities:
+                st.write(f"• {activity}")
+                time.sleep(1.5)
+
+def generate_fallback_report(symbol, stock_data, period):
+    """Generate a fallback report if AI collaboration fails"""
+    if stock_data is None or stock_data.empty:
+        return "Unable to fetch stock data. Please check the symbol and try again."
+    
+    current_price = stock_data['Close'].iloc[-1]
+    high_price = stock_data['High'].max()
+    low_price = stock_data['Low'].min()
+    start_price = stock_data['Close'].iloc[0]
+    pct_change = ((current_price - start_price) / start_price) * 100
+    
+    report = f"""
+# {symbol} Stock Performance Analysis - {period.capitalize()}
+
+## Key Statistics
+
+- **Current Price**: ${current_price:.2f}
+- **Highest Price**: ${high_price:.2f}
+- **Lowest Price**: ${low_price:.2f}
+- **Price Change**: ${current_price - start_price:.2f} ({pct_change:.2f}%)
+- **Analysis Period**: {period}
+
+## Performance Summary
+
+The stock of {symbol} has shown {'positive' if pct_change > 0 else 'negative'} performance during the {period}, 
+with a total change of {pct_change:.2f}%.
+
+## Market Context
+
+This analysis covers the period up to July 26, 2024. The stock demonstrated volatility typical of equity markets, 
+with fluctuations influenced by market conditions, company performance, and broader economic factors.
+
+## Conclusion
+
+Based on the {period} performance, {symbol} has {'outperformed' if pct_change > 0 else 'underperformed'} relative to its starting price. 
+Investors should consider this performance in the context of their investment strategy and market conditions.
+
+*Note: This is an automated analysis. Please conduct additional research before making investment decisions.*
+"""
+    
+    return report
 
 if __name__ == "__main__":
     main()

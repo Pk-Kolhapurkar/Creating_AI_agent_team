@@ -1,6 +1,7 @@
 streamlit>=1.28.0
 pyautogen>=0.2.0
 groq>=0.3.0
+openai>=1.0.0
 asyncio
 python-dotenv
-autogen
+requests

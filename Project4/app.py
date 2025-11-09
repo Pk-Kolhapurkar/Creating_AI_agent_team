@@ -1,35 +1,54 @@
 import streamlit as st
 import autogen
 from groq import Groq
-import matplotlib.pyplot as plt
-import io
-import base64
+import asyncio
+import threading
+from queue import Queue
+import time
 
 # Set page configuration
 st.set_page_config(
-    page_title="Stock Report Generator",
+    page_title="AI Stock Report Generator",
     page_icon="📈",
     layout="wide"
 )
 
 # Initialize Groq client
-@st.cache_resource
 def get_groq_client():
     return Groq(api_key="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")
 
-# Initialize AutoGen agents
-@st.cache_resource
+# Custom LLM configuration for Groq
+class GroqLLMConfig:
+    def __init__(self):
+        self.client = get_groq_client()
+    
+    def create_chat_completion(self, messages, **kwargs):
+        try:
+            response = self.client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages,
+                temperature=kwargs.get('temperature', 0.7),
+                max_tokens=kwargs.get('max_tokens', 1024),
+                top_p=kwargs.get('top_p', 1),
+                stream=False,
+                stop=kwargs.get('stop', None)
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+# Initialize AutoGen agents with Groq
 def initialize_agents():
+    groq_llm = GroqLLMConfig()
+    
     llm_config = {
-        "config_list": [
-            {
-                "model": "llama-3.3-70b-versatile",
-                "api_key": "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",
-                "api_type": "groq"
-            }
-        ],
-        "temperature": 0.7,
-        "timeout": 120
+        "config_list": [{
+            "type": "groq",
+            "model": "llama-3.3-70b-versatile",
+            "api_key": "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"
+        }],
+        "timeout": 120,
+        "temperature": 0.7
     }
 
     # User Proxy Agent
@@ -86,127 +105,222 @@ def initialize_agents():
 
     return user_proxy, planner, engineer, executor, writer
 
-def generate_stock_report(stock_symbol, period="1mo"):
-    """Generate stock report using Groq model"""
-    
-    prompt = f"""
-    Write a comprehensive blog post about the stock price performance of {stock_symbol} 
-    in the past {period}. Today's date is 2024-07-26.
-    
-    The blog post should include:
-    1. Key statistics (average price, highest price, lowest price, percentage change)
-    2. Stock price trend analysis
-    3. Market context and influencing factors
-    4. Conclusion and outlook
-    
-    Format the response in markdown with appropriate headings and sections.
-    """
-    
-    client = get_groq_client()
-    
+# Custom group chat manager to capture messages
+class StreamlitGroupChatManager(autogen.GroupChatManager):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.message_queue = Queue()
+        
+    def send(self, message, recipient, request_reply=None, silent=False):
+        # Capture messages for Streamlit display
+        if hasattr(self, 'message_queue'):
+            self.message_queue.put({
+                'sender': self.name,
+                'recipient': recipient.name,
+                'message': message
+            })
+        return super().send(message, recipient, request_reply=request_reply, silent=silent)
+
+def run_group_chat(task, message_container, progress_bar):
+    """Run the group chat and update Streamlit UI with progress"""
     try:
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            temperature=0.7,
-            max_completion_tokens=2048,
-            top_p=1,
-            stream=False,
-            stop=None
+        # Initialize agents
+        user_proxy, planner, engineer, executor, writer = initialize_agents()
+        
+        # Create group chat
+        groupchat = autogen.GroupChat(
+            agents=[user_proxy, engineer, writer, executor, planner],
+            messages=[],
+            max_round=20,
         )
         
-        return completion.choices[0].message.content
+        # Create custom manager
+        manager = StreamlitGroupChatManager(
+            groupchat=groupchat, 
+            llm_config=initialize_agents()[0].llm_config  # Get llm_config from any agent
+        )
+        
+        # Start the chat
+        message_container.info("🚀 Starting AI team collaboration...")
+        
+        # Run the chat
+        chat_result = user_proxy.initiate_chat(
+            manager,
+            message=task,
+            max_turns=20
+        )
+        
+        return chat_result
         
     except Exception as e:
-        return f"Error generating report: {str(e)}"
+        message_container.error(f"Error in group chat: {str(e)}")
+        return None
 
 def main():
-    st.title("📈 AI Stock Report Generator")
-    st.markdown("Generate comprehensive stock performance reports using AI agents")
+    st.title("🤖 AI Stock Report Generator")
+    st.markdown("Using Multi-Agent System with AutoGen and Groq LLaMA 3.3 70B")
     
-    # Sidebar for configuration
+    # Sidebar configuration
     with st.sidebar:
-        st.header("Configuration")
-        stock_symbol = st.text_input("Stock Symbol", value="NVDA", 
-                                   help="Enter the stock symbol (e.g., NVDA, AAPL, TSLA)")
+        st.header("📊 Stock Analysis Setup")
         
-        period_options = {
-            "1 Month": "1mo",
-            "3 Months": "3mo", 
-            "6 Months": "6mo",
-            "1 Year": "1y",
-            "YTD": "ytd"
-        }
+        stock_symbol = st.text_input(
+            "Stock Symbol", 
+            value="NVDA",
+            help="Enter the stock symbol (e.g., NVDA, AAPL, TSLA)"
+        )
         
-        period = st.selectbox("Time Period", list(period_options.keys()))
-        period_value = period_options[period]
+        analysis_period = st.selectbox(
+            "Analysis Period",
+            ["Past Month", "Past 3 Months", "Past 6 Months", "Past Year", "YTD"],
+            index=0
+        )
         
-        generate_btn = st.button("Generate Stock Report", type="primary")
-    
-    # Main content area
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        st.subheader("Stock Report")
-        
-        if generate_btn:
-            with st.spinner("🤖 AI agents are collaborating to generate your report..."):
-                
-                # Show agent activity
-                with st.expander("👥 Agent Activity", expanded=True):
-                    st.info("🔄 Initializing AI team...")
-                    st.info("📊 Planner determining data requirements...")
-                    st.info("💻 Engineer writing analysis code...")
-                    st.info("📈 Executor running analysis...")
-                    st.info("✍️ Writer compiling final report...")
-                
-                # Generate report
-                report = generate_stock_report(stock_symbol, period_value)
-                
-                if report.startswith("Error"):
-                    st.error(report)
-                else:
-                    st.markdown(report)
-                    
-                    # Download button
-                    st.download_button(
-                        label="📥 Download Report",
-                        data=report,
-                        file_name=f"{stock_symbol}_stock_report.md",
-                        mime="text/markdown"
-                    )
-    
-    with col2:
-        st.subheader("About This App")
+        st.markdown("---")
+        st.markdown("### 🎯 AI Team Members")
         st.markdown("""
-        This app uses a team of specialized AI agents:
-        
-        - **🤖 Planner**: Determines what data is needed
-        - **💻 Engineer**: Writes analysis code  
-        - **📊 Executor**: Runs the analysis
-        - **✍️ Writer**: Creates the final report
-        
-        The agents collaborate using the **Groq LLaMA 3.3 70B** model
-        to generate comprehensive stock analysis reports.
+        - **Planner**: Determines data requirements
+        - **Engineer**: Writes analysis code
+        - **Executor**: Runs the code
+        - **Writer**: Creates final report
         """)
         
-        st.info("💡 **Tip**: Use clear stock symbols for best results")
+        generate_btn = st.button("Generate Stock Report", type="primary", use_container_width=True)
+    
+    # Main content area
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        if generate_btn:
+            # Create task string
+            task = f"Write a blogpost about the stock price performance of {stock_symbol} in the {analysis_period.lower()}. Today's date is 2024-07-26."
+            
+            st.subheader("📋 Task")
+            st.info(task)
+            
+            # Create containers for progress and results
+            progress_container = st.container()
+            message_container = st.empty()
+            result_container = st.container()
+            
+            with progress_container:
+                st.subheader("👥 AI Team Activity")
+                
+                # Initialize progress
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                # Simulate progress updates
+                for i in range(5):
+                    status_text.text(f"🔄 Step {i+1}/5: AI agents collaborating...")
+                    progress_bar.progress((i + 1) * 20)
+                    time.sleep(1)
+                
+                status_text.text("✅ Generating final report...")
+                progress_bar.progress(100)
+            
+            # Run the group chat
+            with st.spinner("AI agents are working together to generate your report..."):
+                try:
+                    # Initialize agents and run chat
+                    user_proxy, planner, engineer, executor, writer = initialize_agents()
+                    
+                    # Create group chat
+                    groupchat = autogen.GroupChat(
+                        agents=[user_proxy, engineer, writer, executor, planner],
+                        messages=[],
+                        max_round=15,
+                    )
+                    
+                    # Create manager
+                    manager = autogen.GroupChatManager(
+                        groupchat=groupchat, 
+                        llm_config=user_proxy.llm_config
+                    )
+                    
+                    # Run the chat
+                    chat_result = user_proxy.initiate_chat(
+                        manager,
+                        message=task,
+                        max_turns=15
+                    )
+                    
+                    # Display results
+                    with result_container:
+                        st.subheader("📄 Generated Stock Report")
+                        
+                        if hasattr(chat_result, 'summary'):
+                            st.markdown(chat_result.summary)
+                        else:
+                            # Extract the last message which should be the report
+                            if chat_result and hasattr(chat_result, 'chat_history'):
+                                last_message = chat_result.chat_history[-1] if chat_result.chat_history else "No report generated"
+                                if hasattr(last_message, 'content'):
+                                    st.markdown(last_message.content)
+                                else:
+                                    st.markdown(str(last_message))
+                            else:
+                                st.error("No report was generated. Please try again.")
+                    
+                    message_container.success("🎉 Stock report generated successfully!")
+                    
+                except Exception as e:
+                    message_container.error(f"❌ Error: {str(e)}")
+                    st.error("Please check your API key and try again.")
         
-        # Example reports
-        with st.expander("📋 Example Stock Symbols"):
-            st.write("""
-            - **NVDA**: NVIDIA Corporation
-            - **AAPL**: Apple Inc.
-            - **TSLA**: Tesla, Inc.
-            - **MSFT**: Microsoft Corporation
-            - **GOOGL**: Alphabet Inc.
-            - **AMZN**: Amazon.com, Inc.
+        else:
+            # Show instructions when no report is generated
+            st.subheader("Welcome to AI Stock Report Generator")
+            st.markdown("""
+            ### How it works:
+            
+            1. **Enter a stock symbol** in the sidebar (e.g., NVDA, AAPL, TSLA)
+            2. **Select analysis period** for the report
+            3. **Click 'Generate Stock Report'** to start the AI team
+            
+            ### What happens behind the scenes:
+            
+            🤖 **Planner Agent**: Analyzes what data is needed
+            💻 **Engineer Agent**: Writes Python code to fetch and analyze stock data  
+            📊 **Executor Agent**: Runs the code and processes the data
+            ✍️ **Writer Agent**: Creates a comprehensive blog post with analysis
+            
+            The agents collaborate using the **Groq LLaMA 3.3 70B model** to generate professional stock reports.
             """)
+    
+    with col2:
+        st.subheader("🔍 Live Agent Activity")
+        
+        if generate_btn:
+            # Simulate agent activity
+            agent_activities = [
+                "🔄 Planner: Determining data requirements...",
+                "💻 Engineer: Writing analysis code...",
+                "📊 Executor: Fetching stock data...",
+                "📈 Executor: Calculating statistics...",
+                "✍️ Writer: Compiling final report...",
+                "✅ Finalizing report...",
+            ]
+            
+            activity_container = st.container()
+            
+            with activity_container:
+                for i, activity in enumerate(agent_activities):
+                    st.write(f"{activity}")
+                    time.sleep(1.5)
+        
+        st.markdown("---")
+        st.subheader("📋 Supported Stocks")
+        st.markdown("""
+        - **NVDA**: NVIDIA
+        - **AAPL**: Apple
+        - **TSLA**: Tesla
+        - **MSFT**: Microsoft
+        - **GOOGL**: Google
+        - **AMZN**: Amazon
+        - **META**: Meta
+        - **And many more...**
+        """)
 
 if __name__ == "__main__":
     main()
